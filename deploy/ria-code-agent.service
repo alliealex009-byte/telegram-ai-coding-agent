@@ -1,0 +1,22 @@
+[Unit]
+Description=Telegram AI Coding Agent
+After=network-online.target ollama.service docker.service
+Wants=network-online.target
+[Service]
+Type=simple
+User=riaagent
+Group=riaagent
+WorkingDirectory=/opt/telegram-ai-coding-agent
+EnvironmentFile=/opt/telegram-ai-coding-agent/.env
+ExecStart=/opt/telegram-ai-coding-agent/.venv/bin/python -m app.main
+Restart=always
+RestartSec=5
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/telegram-ai-coding-agent/workspaces
+# Configure access to a dedicated rootless Docker daemon before enabling.
+[Install]
+WantedBy=multi-user.target
