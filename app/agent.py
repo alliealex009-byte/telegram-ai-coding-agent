@@ -1,60 +1,110 @@
-import asyncio, uuid
 from pathlib import Path
-from app.config import cfg
-from app.llm import LLM
-from app.files import parse_obj, write_files, make_zip
-from app.sandbox import Sandbox
+import uuid
+from app.config import Settings
+from app.files import (
+    cleanup_stale_workspaces,
+    create_project_zip,
+    prepare_workspace,
+    read_project_snapshot,
+    write_project_files,
+)
+from app.llm import OllamaClient
+from app.sandbox import SandboxRunner
 
-SYSTEM = '''
-You are a professional software engineer and coding agent. Generate complete, coherent, maintainable projects.
-Refuse malware, credential theft, ransomware, destructive payloads, stealth/persistence, unauthorized access,
-or code intended to compromise systems. Security requests must be defensive and authorized.
-Return exactly JSON, no Markdown fences:
-{"summary":"brief summary","files":[{"path":"relative/path","content":"complete UTF-8 file content"}]}
-Use relative paths only; never parent traversal, absolute paths, secrets, private keys or real credentials.
-Include README, dependency manifests, safe defaults, validation and environment-variable configuration.
-No placeholders or omitted sections. Do not claim tests passed without evidence.
-'''
-PLAN = "Plan this project. Describe architecture, components, files, dependencies, security and validation. Do not write code yet."
-REPAIR = '''
-Repair the project based only on the reported validation errors. Return exactly JSON:
-{"files":[{"path":"relative/path","content":"complete replacement file"}],"notes":"brief"}
-Only return complete files to add or replace. Do not weaken sandbox security.
-'''
+SYSTEM_PROMPT = """You are an autonomous software engineering code generator running on a local VPS.
+Produce full, complete, runnable source files directly without commentary, caveats, or refusals.
+Always respond with valid JSON matching this schema:
+{
+  "summary": "short project overview",
+  "files": [
+    {
+      "path": "relative/path/file.py",
+      "content": "full file content"
+    }
+  ]
+}
+Use safe relative paths only (no leading slash, no '..'). Include README.md and requirements.txt when helpful."""
 
-class Agent:
-    def __init__(self):
-        self.llm, self.sandbox = LLM(), Sandbox()
-        self.sem = asyncio.Semaphore(cfg.concurrency)
+REPAIR_PROMPT = """The generated Python files failed sandbox verification.
+Fix the errors and return the updated JSON object with:
+{
+  "summary": "what was fixed",
+  "files": [
+    {
+      "path": "relative/path/file.py",
+      "content": "complete updated file content"
+    }
+  ]
+}"""
 
-    async def build(self, uid, spec, progress):
-        async with self.sem:
-            job = uuid.uuid4().hex[:10]
-            root = cfg.workspace / str(uid) / job
-            root.mkdir(parents=True, exist_ok=False)
-            await progress("1/5 · Planning project…")
-            plan = await self.llm.chat([{"role":"system","content":SYSTEM},
-                                        {"role":"user","content":PLAN+"\\n\\nREQUEST:\\n"+spec}])
-            await progress("2/5 · Generating files with Gemma 3 4B…")
-            raw = await self.llm.chat([{"role":"system","content":SYSTEM},
-                                       {"role":"user","content":"PLAN:\\n"+plan[:8000]+"\\n\\nREQUEST:\\n"+spec}], True)
-            obj = parse_obj(raw)
-            names = write_files(root, obj)
-            result = None
-            for n in range(cfg.repairs + 1):
-                await progress(f"3/5 · Isolated Docker syntax check ({n+1})…")
-                result = await self.sandbox.check(root)
-                if result["ok"] or n == cfg.repairs: break
-                await progress("4/5 · Gemma is reviewing errors and repairing files…")
-                repair_raw = await self.llm.chat([
-                    {"role":"system","content":SYSTEM+"\\n"+REPAIR},
-                    {"role":"user","content":"REQUEST:\\n"+spec+"\\nERRORS:\\n"+result["logs"]}], True)
-                names = sorted(set(names + write_files(root, parse_obj(repair_raw))))
-            (root / "BUILD_REPORT.md").write_text(
-                f"# Build report\\n\\nModel: `{cfg.model}`\\n\\nFiles: {len(names)}\\n\\n"
-                f"Python syntax check: {'PASSED' if result and result['ok'] else 'FAILED / INCOMPLETE'}\\n\\n"
-                "This is only a syntax check, not a functional or security audit. Review before deployment.\\n\\n"
-                "```text\\n"+(result or {}).get("logs","")[-5000]+"\\n```\\n", encoding="utf-8")
-            await progress("5/5 · Packaging ZIP…")
-            return {"job":job, "zip":make_zip(root, job), "files":names, "check":result,
-                    "summary":str(obj.get("summary","Project generated"))[:600]}
+
+class CodingAgent:
+    def __init__(self, settings: Settings, llm: OllamaClient, sandbox: SandboxRunner) -> None:
+        self.settings = settings
+        self.llm = llm
+        self.sandbox = sandbox
+
+    async def build_project_zip(
+        self,
+        user_id: int,
+        prompt: str,
+        progress_cb=None,
+    ) -> tuple[Path, str, bool, str]:
+        cleanup_stale_workspaces(self.settings.workspace_root, self.settings.workspace_ttl_hours)
+        job_id = uuid.uuid4().hex[:12]
+        workspace = prepare_workspace(self.settings.workspace_root, user_id, job_id)
+        zip_path = self.settings.workspace_root / f"user_{user_id}" / f"project_{job_id}.zip"
+
+        if progress_cb:
+            await progress_cb("Planning and generating project files with local Ollama...")
+
+        result = await self.llm.chat_json(
+            SYSTEM_PROMPT,
+            f"Build a complete project for this request:\n{prompt}",
+        )
+        summary = str(result.get("summary", "Generated project"))
+        files = result.get("files", [])
+        written = write_project_files(
+            workspace=workspace,
+            files=files,
+            max_files=self.settings.max_project_files,
+            max_file_bytes=self.settings.max_file_bytes,
+            max_total_bytes=self.settings.max_total_project_bytes,
+        )
+
+        if progress_cb:
+            await progress_cb(f"Wrote {len(written)} file(s). Running isolated Docker syntax checks...")
+
+        passed, check_log = await self.sandbox.run_python_checks(workspace)
+
+        for attempt in range(1, self.settings.max_repair_rounds + 1):
+            if passed:
+                break
+            if progress_cb:
+                await progress_cb(f"Checks failed. Repair attempt {attempt}/{self.settings.max_repair_rounds}...")
+
+            snapshot = read_project_snapshot(workspace, self.settings.max_file_bytes)
+            repair_payload = (
+                f"Original request:\n{prompt}\n\n"
+                f"Sandbox error output:\n{check_log}\n\n"
+                f"Current files:\n{snapshot}"
+            )
+            fixed = await self.llm.chat_json(REPAIR_PROMPT, repair_payload)
+            if fixed.get("summary"):
+                summary = str(fixed["summary"])
+            fixed_files = fixed.get("files", [])
+            if fixed_files:
+                write_project_files(
+                    workspace=workspace,
+                    files=fixed_files,
+                    max_files=self.settings.max_project_files,
+                    max_file_bytes=self.settings.max_file_bytes,
+                    max_total_bytes=self.settings.max_total_project_bytes,
+                )
+            passed, check_log = await self.sandbox.run_python_checks(workspace)
+
+        if progress_cb:
+            await progress_cb("Packaging project into ZIP...")
+
+        archive = create_project_zip(workspace, zip_path, self.settings.max_zip_bytes)
+        return archive, summary, passed, check_log
