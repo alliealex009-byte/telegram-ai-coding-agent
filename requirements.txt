@@ -1,0 +1,1 @@
+aiogram>=3.13,<4\naiohttp>=3.10,<4\npython-dotenv>=1.0,<2\ndocker>=7.1,<8\n
