@@ -1,100 +1,123 @@
-import asyncio, logging
-from aiogram import Bot, Dispatcher, F
-from aiogram.filters import Command
-from aiogram.types import Message, FSInputFile
+import asyncio
+import logging
+from aiogram import Bot, Dispatcher, F, Router
 from aiogram.enums import ChatType
-from app.config import cfg
-from app.agent import Agent
+from aiogram.filters import Command, CommandStart
+from aiogram.types import FSInputFile, Message
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-bot, dp, agent = Bot(cfg.bot_token), Dispatcher(), Agent()
-jobs, locks = {}, {}
+from app.agent import CodingAgent
+from app.config import Settings, load_settings
+from app.llm import OllamaClient
+from app.sandbox import SandboxRunner
 
-async def permitted(m):
-    if m.chat.type != ChatType.PRIVATE:
-        await m.answer("Please use me in a private DM.")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+logger = logging.getLogger(__name__)
+
+router = Router()
+
+
+def is_authorized(message: Message, settings: Settings) -> bool:
+    if message.chat.type != ChatType.PRIVATE:
         return False
-    if cfg.allow_ids and m.from_user.id not in cfg.allow_ids:
-        await m.answer("This bot is restricted to authorized users.")
-        return False
-    return True
+    if not settings.allowed_user_ids:
+        return True
+    return bool(message.from_user and message.from_user.id in settings.allowed_user_ids)
 
-@dp.message(Command("start"))
-async def start(m):
-    if await permitted(m):
-        await m.answer("Hi! I'm your VPS AI Coding Agent. Send a project description and I'll generate files, run isolated checks, attempt fixes, and return a ZIP. Use /help.")
 
-@dp.message(Command("help"))
-async def help_cmd(m):
-    if await permitted(m):
-        await m.answer("/new — start a build\n/status — current build\n/cancel — cancel\n/about — model details\n\nDescribe the language, features, database, APIs and deployment target.")
-
-@dp.message(Command("new"))
-async def new(m):
-    if await permitted(m): await m.answer("Now send your detailed project description.")
-
-@dp.message(Command("about"))
-async def about(m):
-    if await permitted(m):
-        await m.answer(f"Primary model: {cfg.model}\nInference: local Ollama on VPS\nExecution: restricted Docker sandbox\nDelivery: ZIP in this DM")
-
-@dp.message(Command("status"))
-async def status(m):
-    if await permitted(m):
-        await m.answer("Build running." if jobs.get(m.from_user.id) else "No active build.")
-
-@dp.message(Command("cancel"))
-async def cancel(m):
-    if await permitted(m):
-        task = jobs.get(m.from_user.id)
-        if task and not task.done():
-            task.cancel()
-            await m.answer("Cancellation requested.")
-        else: await m.answer("No active build.")
-
-@dp.message(F.text)
-async def build(m):
-    if not await permitted(m): return
-    spec = (m.text or "").strip()
-    if spec.startswith("/"): return
-    if len(spec) < 20:
-        await m.answer("Please describe the project in more detail (at least 20 characters).")
+@router.message(CommandStart())
+async def cmd_start(message: Message, settings: Settings) -> None:
+    if not is_authorized(message, settings):
         return
-    if len(spec) > 10000:
-        await m.answer("Please keep your request under 10,000 characters.")
+    await message.answer(
+        "Send me a project specification in private DM.\n"
+        "I will generate the files using local Ollama, verify them in an isolated Docker sandbox, "
+        "attempt automated repairs if needed, and send you a .zip archive.\n\n"
+        "Commands: /help, /about"
+    )
+
+
+@router.message(Command("help"))
+async def cmd_help(message: Message, settings: Settings) -> None:
+    if not is_authorized(message, settings):
         return
-    uid = m.from_user.id
-    lock = locks.setdefault(uid, asyncio.Lock())
-    if lock.locked():
-        await m.answer("You already have a build running. Use /status or /cancel.")
+    await message.answer(
+        "Send any coding prompt in DM (for example: 'Create a FastAPI TODO app with SQLite and tests').\n"
+        "The output is delivered as a .zip file."
+    )
+
+
+@router.message(Command("about"))
+async def cmd_about(message: Message, settings: Settings) -> None:
+    if not is_authorized(message, settings):
         return
-    async with lock:
-        msg = await m.answer("Request accepted. Starting coding agent…")
-        async def progress(s):
-            try: await msg.edit_text(s)
-            except Exception: pass
-        task = asyncio.current_task()
-        jobs[uid] = task
+    await message.answer(
+        f"Model: {settings.ollama_model}\n"
+        f"Sandbox: {settings.sandbox_image}\n"
+        f"Max repair rounds: {settings.max_repair_rounds}"
+    )
+
+
+@router.message(F.text & ~F.text.startswith("/"))
+async def handle_prompt(
+    message: Message,
+    settings: Settings,
+    agent: CodingAgent,
+    job_semaphore: asyncio.Semaphore,
+) -> None:
+    if not is_authorized(message, settings):
+        return
+    assert message.from_user is not None
+    prompt = message.text.strip()
+    if not prompt:
+        return
+
+    status_msg = await message.answer("Queued build job...")
+
+    async def update_status(text: str) -> None:
         try:
-            result = await agent.build(uid, spec, progress)
-            passed = result["check"] and result["check"]["ok"]
-            await m.answer_document(
-                FSInputFile(result["zip"], filename=f"project_{result['job']}.zip"),
-                caption=f"ZIP ready 📦\nJob: {result['job']}\nFiles: {len(result['files'])}\nPython syntax check: {'PASSED' if passed else 'NOT PASSED'}\nReview BUILD_REPORT.md and source before deployment."
-            )
-            await progress("Completed. ZIP delivered.")
-        except asyncio.CancelledError:
-            await progress("Build cancelled.")
-            raise
-        except Exception as e:
-            logging.exception("Build failed")
-            await progress("Build failed: " + str(e)[:700])
-        finally:
-            jobs.pop(uid, None)
+            await status_msg.edit_text(text)
+        except Exception:
+            pass
 
-async def main():
-    cfg.workspace.mkdir(parents=True, exist_ok=True)
-    logging.info("Starting Telegram AI Coding Agent with %s", cfg.model)
-    await dp.start_polling(bot)
+    try:
+        async with asyncio.timeout(settings.max_job_seconds):
+            async with job_semaphore:
+                zip_path, summary, passed, check_log = await agent.build_project_zip(
+                    user_id=message.from_user.id,
+                    prompt=prompt,
+                    progress_cb=update_status,
+                )
 
-if __name__ == "__main__": asyncio.run(main())
+        status_label = "Passed sandbox checks" if passed else "Completed with sandbox warnings"
+        caption = f"{summary[:700]}\nStatus: {status_label}"
+        await message.answer_document(document=FSInputFile(zip_path), caption=caption[:1024])
+        if not passed and check_log:
+            await message.answer(f"Sandbox log:\n<pre>{check_log[-3000:]}</pre>", parse_mode="HTML")
+    except TimeoutError:
+        await message.answer("Build timed out before finishing.")
+    except Exception as exc:
+        logger.exception("Build failed")
+        await message.answer(f"Build failed: {exc}")
+
+
+async def main() -> None:
+    settings = load_settings()
+    llm = OllamaClient(settings)
+    sandbox = SandboxRunner(settings)
+    agent = CodingAgent(settings, llm, sandbox)
+    job_semaphore = asyncio.Semaphore(settings.max_concurrent_jobs)
+
+    bot = Bot(token=settings.bot_token)
+    dp = Dispatcher()
+    dp.include_router(router)
+
+    await dp.start_polling(
+        bot,
+        settings=settings,
+        agent=agent,
+        job_semaphore=job_semaphore,
+    )
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
