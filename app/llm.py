@@ -1,24 +1,37 @@
-import aiohttp, asyncio, json
-from app.config import cfg
+import json
+import aiohttp
+from app.config import Settings
 
-class LLM:
-    async def chat(self, messages, json_mode=False):
-        payload = {"model": cfg.model, "messages": messages, "stream": False,
-                   "options": {"temperature": cfg.temperature, "num_ctx": cfg.num_ctx,
-                               "num_predict": cfg.num_predict}}
-        if json_mode: payload["format"] = "json"
-        timeout = aiohttp.ClientTimeout(total=cfg.timeout)
-        error = None
-        for attempt in range(2):
-            try:
-                async with aiohttp.ClientSession(timeout=timeout) as s:
-                    async with s.post(cfg.ollama_url + "/api/chat", json=payload) as r:
-                        body = await r.text()
-                        if r.status != 200: raise RuntimeError(f"Ollama HTTP {r.status}: {body[:400]}")
-                        result = json.loads(body).get("message", {}).get("content", "")
-                        if not result.strip(): raise RuntimeError("Empty Ollama response")
-                        return result
-            except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, RuntimeError) as e:
-                error = e
-                if attempt == 0: await asyncio.sleep(2)
-        raise RuntimeError(f"Ollama request failed: {error}")
+
+class OllamaClient:
+    def __init__(self, settings: Settings) -> None:
+        self.settings = settings
+
+    async def chat_json(self, system_prompt: str, user_prompt: str) -> dict:
+        payload = {
+            "model": self.settings.ollama_model,
+            "stream": False,
+            "format": "json",
+            "options": {
+                "temperature": self.settings.ollama_temperature,
+                "num_ctx": self.settings.ollama_num_ctx,
+                "num_predict": self.settings.ollama_num_predict,
+            },
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+        }
+        timeout = aiohttp.ClientTimeout(total=self.settings.ollama_timeout_seconds)
+        url = f"{self.settings.ollama_base_url}/api/chat"
+
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(url, json=payload) as resp:
+                resp.raise_for_status()
+                data = await resp.json()
+
+        content = data.get("message", {}).get("content", "")
+        if not content:
+            raise ValueError("Empty response received from Ollama")
+
+        return json.loads(content)
